@@ -17,6 +17,20 @@ class CronJobService(CRUDService):
         return data
 
     @private
+    async def construct_cron_command(self, schedule, user, command, stdout=True, stderr=True):
+        return list(
+            filter(
+                bool, (
+                    schedule['minute'], schedule['hour'], schedule['dom'], schedule['month'],
+                    schedule['dow'], user,
+                    'PATH="/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:/root/bin"',
+                    command.replace('\n', '').replace('%', r'\%'),
+                    '> /dev/null' if stdout else '', '2> /dev/null' if stderr else ''
+                )
+            )
+        )
+
+    @private
     async def validate_data(self, data, schema):
         verrors = ValidationErrors()
 
@@ -41,14 +55,38 @@ class CronJobService(CRUDService):
                     'Specified user does not exist'
                 )
 
+        command = data.get('command')
+        if not command:
+            verrors.add(
+                f'{schema}.command',
+                'Please specify a command for cronjob task.'
+            )
+        else:
+            crontab_cmd = (await self.construct_cron_command(
+                data['schedule'], user, command, data['stdout'], data['stderr']
+            ))[6:]
+            command = crontab_cmd.pop(1)
+
+            # cron(8) when reads an entry from a crontab, it keeps a buffer of 1000 characters and anything more then
+            # that is truncated. So we validate that the user supplied command is not of more then 1000 characters.
+            allowed_length = 1000 - len(' '.join(crontab_cmd))
+
+            if len(command) > allowed_length:
+                verrors.add(
+                    f'{schema}.command',
+                    f'Command must be less then or equal to {allowed_length} characters. '
+                    'It should be noted that in the command provided, all newline characters are removed and '
+                    '"%" characters are escaped with backslash.'
+                )
+
         return verrors, data
 
     @accepts(
         Dict(
             'cron_job_create',
             Bool('enabled'),
-            Bool('stderr'),
-            Bool('stdout'),
+            Bool('stderr', default=False),
+            Bool('stdout', default=True),
             Cron('schedule'),
             Str('command', required=True),
             Str('description'),
@@ -104,7 +142,7 @@ class CronJobService(CRUDService):
 
         await self.middleware.call('service.restart', 'cron')
 
-        return data
+        return await self._get_instance(data['id'])
 
     @accepts(
         Int('id', validators=[Range(min=1)]),
@@ -137,7 +175,7 @@ class CronJobService(CRUDService):
 
             await self.middleware.call('service.restart', 'cron')
 
-        return await self.query(filters=[('id', '=', id)], options={'get': True})
+        return await self._get_instance(id)
 
     @accepts(
         Int('id')
